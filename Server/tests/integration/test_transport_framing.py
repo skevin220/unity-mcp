@@ -232,3 +232,153 @@ def test_zero_length_payload_heartbeat():
         conn.disconnect()
 
 
+def start_auth_enforcing_bridge(expected_token: str):
+    """In-process stand-in for the hardened Unity bridge (StdioBridgeHost).
+
+    Mirrors the auth gate exactly: it greets with FRAMING=1, then requires the
+    client's FIRST framed message to be {"auth_token": <expected_token>}. A wrong
+    or missing token is denied and the connection closed — same as the real gate.
+    Only after a successful auth does it answer a framed ``ping`` with a framed
+    pong. Accepts repeated connections until ``stop`` is set.
+
+    Returns ``(port, stop)`` where ``stop`` is a threading.Event.
+    """
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    srv.settimeout(0.2)
+    port = srv.getsockname()[1]
+    stop = threading.Event()
+
+    def _read_exact(conn, n: int):
+        buf = b""
+        while len(buf) < n:
+            chunk = conn.recv(n - len(buf))
+            if not chunk:
+                return None
+            buf += chunk
+        return buf
+
+    def _serve_one(conn):
+        try:
+            conn.settimeout(1.0)
+            conn.sendall(b"WELCOME UNITY-MCP 1 FRAMING=1\n")
+
+            # Auth gate: first framed message must be a valid {"auth_token": ...}
+            header = _read_exact(conn, 8)
+            if header is None:
+                return
+            body = _read_exact(conn, struct.unpack(">Q", header)[0]) or b""
+            try:
+                presented = json.loads(body.decode("utf-8")).get("auth_token")
+            except Exception:
+                presented = None
+            if presented != expected_token:
+                deny = b'{"status":"error","error":"unauthorized: invalid or missing bridge token"}'
+                conn.sendall(struct.pack(">Q", len(deny)) + deny)
+                return
+            ack = b'{"status":"success","result":{"message":"authenticated"}}'
+            conn.sendall(struct.pack(">Q", len(ack)) + ack)
+
+            # Command loop (single round-trip is enough for the probe): pong a ping.
+            header = _read_exact(conn, 8)
+            if header is None:
+                return
+            cmd = _read_exact(conn, struct.unpack(">Q", header)[0]) or b""
+            if cmd.strip() == b"ping":
+                pong = b'{"status":"success","result":{"message":"pong"}}'
+                conn.sendall(struct.pack(">Q", len(pong)) + pong)
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _run():
+        try:
+            while not stop.is_set():
+                try:
+                    conn, _ = srv.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                _serve_one(conn)
+        finally:
+            try:
+                srv.close()
+            except Exception:
+                pass
+
+    threading.Thread(target=_run, daemon=True).start()
+    return port, stop
+
+
+def test_probe_authenticates_against_hardened_gate(monkeypatch):
+    """Regression: the discovery probe must present the bridge token before ping.
+
+    Before the fix, _try_probe_unity_mcp sent a bare framed ``ping`` as its first
+    frame. The hardened bridge rejects any unauthenticated connection, so the probe
+    was denied and discovery reported the live, healthy port as dead (0 instances).
+    """
+    from transport.legacy.port_discovery import PortDiscovery
+
+    token = "regression-bridge-token-abc123"
+    monkeypatch.setenv("UNITY_MCP_BRIDGE_TOKEN", token)
+    port, stop = start_auth_enforcing_bridge(token)
+    try:
+        assert PortDiscovery._try_probe_unity_mcp(port) is True
+    finally:
+        stop.set()
+
+
+def test_probe_rejected_on_token_mismatch(monkeypatch):
+    """The probe genuinely presents the token: a wrong token is rejected by the gate.
+
+    This guards against a "fix" that makes the probe pass by ignoring auth rather
+    than by actually authenticating.
+    """
+    from transport.legacy.port_discovery import PortDiscovery
+
+    monkeypatch.setenv("UNITY_MCP_BRIDGE_TOKEN", "the-wrong-token")
+    port, stop = start_auth_enforcing_bridge("the-expected-token")
+    try:
+        assert PortDiscovery._try_probe_unity_mcp(port) is False
+    finally:
+        stop.set()
+
+
+def test_discovery_finds_instance_behind_auth_gate(monkeypatch, tmp_path):
+    """End-to-end discovery against the hardened gate.
+
+    A status file points discovery at an auth-enforcing bridge. Discovery probes
+    the port while enumerating instances; the probe must authenticate for the
+    instance to be surfaced. Before the fix this returned 0 instances.
+    """
+    from datetime import datetime, timezone
+    from transport.legacy.port_discovery import PortDiscovery
+
+    token = "regression-bridge-token-xyz789"
+    monkeypatch.setenv("UNITY_MCP_BRIDGE_TOKEN", token)
+    # PortDiscovery.get_registry_dir() honors UNITY_MCP_STATUS_DIR.
+    monkeypatch.setenv("UNITY_MCP_STATUS_DIR", str(tmp_path))
+    port, stop = start_auth_enforcing_bridge(token)
+    try:
+        status = {
+            "unity_port": port,
+            "reason": "ready",
+            "project_path": "/tmp/MyProj/Assets",
+            "project_name": "MyProj",
+            "last_heartbeat": datetime.now(timezone.utc).isoformat(),
+        }
+        (tmp_path / "unity-mcp-status-deadbeef.json").write_text(json.dumps(status))
+
+        instances = PortDiscovery.discover_all_unity_instances()
+        assert len(instances) == 1
+        assert instances[0].port == port
+    finally:
+        stop.set()
+
+

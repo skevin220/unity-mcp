@@ -63,28 +63,22 @@ class PortDiscovery:
     @staticmethod
     def _try_probe_unity_mcp(port: int) -> bool:
         """Quickly check if a MCP for Unity listener is on this port.
-        Uses Unity's framed protocol: receives handshake, sends framed ping, expects framed pong.
+
+        Uses Unity's framed protocol: receive the handshake, present the shared
+        bridge token as the first framed message, read the auth ack, then send a
+        framed ping and expect a framed pong.
+
+        The hardened bridge (StdioBridgeHost) rejects and closes any connection
+        whose first framed message is not a valid {"auth_token": ...}
+        (harden/security, R4). The probe must therefore authenticate exactly like
+        UnityConnection.connect() before pinging — otherwise discovery sees its
+        probe rejected and wrongly reports the port as dead.
         """
         try:
             with socket.create_connection(("127.0.0.1", port), PortDiscovery.CONNECT_TIMEOUT) as s:
                 s.settimeout(PortDiscovery.CONNECT_TIMEOUT)
                 try:
-                    # 1. Receive handshake from Unity
-                    handshake = s.recv(512)
-                    if not handshake or b"FRAMING=1" not in handshake:
-                        # Try legacy mode as fallback
-                        s.sendall(b"ping")
-                        data = s.recv(512)
-                        return data and b'"message":"pong"' in data
-
-                    # 2. Send framed ping command
                     # Frame format: 8-byte length header (big-endian uint64) + payload
-                    payload = b"ping"
-                    header = struct.pack('>Q', len(payload))
-                    s.sendall(header + payload)
-
-                    # 3. Receive framed response
-                    # Helper to receive exact number of bytes
                     def _recv_exact(expected: int) -> bytes | None:
                         chunks = bytearray()
                         while len(chunks) < expected:
@@ -94,15 +88,49 @@ class PortDiscovery:
                             chunks.extend(chunk)
                         return bytes(chunks)
 
-                    response_header = _recv_exact(8)
-                    if response_header is None:
+                    def _send_frame(payload: bytes) -> None:
+                        s.sendall(struct.pack('>Q', len(payload)) + payload)
+
+                    def _recv_frame() -> bytes | None:
+                        header = _recv_exact(8)
+                        if header is None:
+                            return None
+                        length = struct.unpack('>Q', header)[0]
+                        if length > 10000:  # Sanity check
+                            return None
+                        return _recv_exact(length)
+
+                    # 1. Receive handshake from Unity
+                    handshake = s.recv(512)
+                    if not handshake or b"FRAMING=1" not in handshake:
+                        # Legacy (pre-FRAMING) bridge: it predates the auth gate, so
+                        # it neither expects nor accepts a token frame — presenting one
+                        # would be misread as a command. Probe with an unframed ping.
+                        s.sendall(b"ping")
+                        data = s.recv(512)
+                        return bool(data) and b'"message":"pong"' in data
+
+                    # 2. Authenticate: present the shared bridge token as the FIRST
+                    # framed message, mirroring UnityConnection.connect(). Imported
+                    # lazily to avoid a module-load import cycle with unity_connection.
+                    from transport.legacy.unity_connection import resolve_bridge_token
+                    auth_payload = json.dumps(
+                        {"auth_token": resolve_bridge_token()}).encode("utf-8")
+                    _send_frame(auth_payload)
+                    ack = _recv_frame()
+                    if ack is None:
+                        return False
+                    try:
+                        ack_obj = json.loads(ack.decode("utf-8", errors="replace"))
+                    except Exception:
+                        return False
+                    if ack_obj.get("status") != "success":
+                        # Auth rejected (or any non-success ack): not a usable listener.
                         return False
 
-                    response_length = struct.unpack('>Q', response_header)[0]
-                    if response_length > 10000:  # Sanity check
-                        return False
-
-                    response = _recv_exact(response_length)
+                    # 3. Send framed ping command and expect a framed pong
+                    _send_frame(b"ping")
+                    response = _recv_frame()
                     if response is None:
                         return False
                     return b'"message":"pong"' in response
