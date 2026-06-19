@@ -5,8 +5,10 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using NUnit.Framework;
+using Newtonsoft.Json.Linq;
 using UnityEngine;
 using UnityEngine.TestTools;
+using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Services.Transport.Transports;
 
 namespace MCPForUnityTests.Editor.Services
@@ -15,6 +17,10 @@ namespace MCPForUnityTests.Editor.Services
     /// Tests that StdioBridgeHost correctly handles client reconnection scenarios.
     /// After an abrupt client disconnect, a new client must be able to connect and
     /// have its commands processed — this was broken by the zombie state bug (#785).
+    ///
+    /// These run against a live host started in setup. Since the R4 hardening, the
+    /// host requires a valid bridge-token handshake as the first framed message, so
+    /// each client authenticates before issuing commands.
     /// </summary>
     [TestFixture]
     public class StdioBridgeReconnectTests
@@ -22,15 +28,47 @@ namespace MCPForUnityTests.Editor.Services
         private const int ConnectTimeoutMs = 5000;
         private const int ReadTimeoutMs = 10000;
 
+        private bool _startedHost;
+        private string _validToken;
+
+        [OneTimeSetUp]
+        public void OneTimeSetUp()
+        {
+            _startedHost = !StdioBridgeHost.IsRunning;
+            if (_startedHost)
+            {
+                StdioBridgeHost.Start();
+            }
+            Assert.IsTrue(StdioBridgeHost.IsRunning,
+                "StdioBridgeHost failed to start; cannot exercise reconnect behavior.");
+            _validToken = BridgeAuth.GetToken();
+        }
+
+        [OneTimeTearDown]
+        public void OneTimeTearDown()
+        {
+            if (_startedHost)
+            {
+                StdioBridgeHost.Stop();
+            }
+        }
+
+        /// <summary>
+        /// Completes the R4 auth handshake on a freshly handshaked stream so the
+        /// client may issue commands. Asserts the bridge accepted the token.
+        /// </summary>
+        private void Authenticate(NetworkStream stream)
+        {
+            var authFrame = new JObject { ["auth_token"] = _validToken };
+            SendFrame(stream, Encoding.UTF8.GetBytes(authFrame.ToString(Newtonsoft.Json.Formatting.None)));
+            byte[] ackBytes = ReadFrame(stream, ReadTimeoutMs);
+            var ack = JObject.Parse(Encoding.UTF8.GetString(ackBytes));
+            Assert.AreEqual("success", (string)ack["status"], "Bridge auth handshake should succeed.");
+        }
+
         [UnityTest]
         public IEnumerator NewClient_AfterAbruptDisconnect_CanSendAndReceiveCommands()
         {
-            if (!StdioBridgeHost.IsRunning)
-            {
-                Assert.Ignore("StdioBridgeHost is not running; skipping reconnect test.");
-                yield break;
-            }
-
             int port = StdioBridgeHost.GetCurrentPort();
 
             // --- First client: connect, verify ping/pong, then abruptly close ---
@@ -43,6 +81,7 @@ namespace MCPForUnityTests.Editor.Services
 
                 string handshake1 = ReadLine(stream1, ReadTimeoutMs);
                 Assert.That(handshake1, Does.Contain("FRAMING=1"), "First client should receive handshake");
+                Authenticate(stream1);
 
                 // Send a framed ping
                 SendFrame(stream1, Encoding.UTF8.GetBytes("ping"));
@@ -69,6 +108,7 @@ namespace MCPForUnityTests.Editor.Services
 
                 string handshake2 = ReadLine(stream2, ReadTimeoutMs);
                 Assert.That(handshake2, Does.Contain("FRAMING=1"), "Second client should receive handshake");
+                Authenticate(stream2);
 
                 // Send a framed ping — this is the critical check that would fail
                 // if the bridge is in zombie state.
@@ -84,12 +124,6 @@ namespace MCPForUnityTests.Editor.Services
         [UnityTest]
         public IEnumerator NewClient_WhileOldClientStillConnected_ClosesStaleClient()
         {
-            if (!StdioBridgeHost.IsRunning)
-            {
-                Assert.Ignore("StdioBridgeHost is not running; skipping reconnect test.");
-                yield break;
-            }
-
             int port = StdioBridgeHost.GetCurrentPort();
 
             // --- First client: connect and verify handshake (but don't close) ---
@@ -103,6 +137,7 @@ namespace MCPForUnityTests.Editor.Services
 
                 string handshake1 = ReadLine(stream1, ReadTimeoutMs);
                 Assert.That(handshake1, Does.Contain("FRAMING=1"), "First client should receive handshake");
+                Authenticate(stream1);
 
                 // Verify ping works on first client
                 SendFrame(stream1, Encoding.UTF8.GetBytes("ping"));
@@ -119,6 +154,7 @@ namespace MCPForUnityTests.Editor.Services
 
                     string handshake2 = ReadLine(stream2, ReadTimeoutMs);
                     Assert.That(handshake2, Does.Contain("FRAMING=1"), "Second client should receive handshake");
+                    Authenticate(stream2);
 
                     // Stale-client cleanup runs synchronously in HandleClientAsync before
                     // the read loop, so by the time we read the handshake it's already done.
