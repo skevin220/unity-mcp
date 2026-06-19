@@ -23,6 +23,15 @@ namespace MCPForUnity.Editor.Tools
         private const int TotalLayerCount = 32;
 
         /// <summary>
+        /// Whether entering play mode is permitted (harden/security, R6). The play
+        /// action runs project/game code, so it is opt-in behind the AllowPlayMode
+        /// pref (default false). Extracted as a seam so the gate decision can be
+        /// verified without triggering a real (and test-corrupting) play transition.
+        /// </summary>
+        internal static bool PlayModeAllowed()
+            => EditorPrefs.GetBool(EditorPrefKeys.AllowPlayMode, false);
+
+        /// <summary>
         /// Main handler for editor management actions.
         /// </summary>
         public static object HandleCommand(JObject @params)
@@ -54,7 +63,7 @@ namespace MCPForUnity.Editor.Tools
                 case "play":
                     // harden/security (R3/R6 posture): entering play mode runs project/game
                     // code — including any scripts the AI just authored — so it is opt-in.
-                    if (!EditorPrefs.GetBool(EditorPrefKeys.AllowPlayMode, false))
+                    if (!PlayModeAllowed())
                     {
                         return new ErrorResponse(
                             "Entering play mode is disabled by default in this hardened build. " +
