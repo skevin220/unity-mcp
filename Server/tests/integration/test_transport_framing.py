@@ -51,6 +51,17 @@ def start_dummy_server(greeting: bytes, respond_ping: bool = False):
                         buf += chunk
                     return buf
 
+                # Complete the bridge auth handshake (harden/security, R4): the
+                # client's first framed message is {"auth_token": ...}. This stub
+                # doesn't validate the token (that's covered elsewhere) — it just
+                # acks success so connect() proceeds and the framing path can be tested.
+                auth_header = _read_exact(8)
+                if len(auth_header) == 8:
+                    auth_len = struct.unpack(">Q", auth_header)[0]
+                    _read_exact(auth_len)  # consume the auth frame
+                    ack = b'{"status":"success","result":{"message":"authenticated"}}'
+                    conn.sendall(struct.pack(">Q", len(ack)) + ack)
+
                 header = _read_exact(8)
                 if len(header) == 8:
                     length = struct.unpack(">Q", header)[0]
@@ -171,9 +182,29 @@ def test_zero_length_payload_heartbeat():
     def _run():
         ready.set()
         conn, _ = sock.accept()
+        conn.settimeout(1.0)
         try:
             conn.sendall(b"MCP/0.1 FRAMING=1\n")
             time.sleep(0.02)
+
+            # Complete the bridge auth handshake (harden/security, R4) before the
+            # heartbeat/pong sequence so connect() proceeds.
+            def _read_exact(n: int) -> bytes:
+                buf = b""
+                while len(buf) < n:
+                    chunk = conn.recv(n - len(buf))
+                    if not chunk:
+                        break
+                    buf += chunk
+                return buf
+
+            auth_header = _read_exact(8)
+            if len(auth_header) == 8:
+                auth_len = struct.unpack(">Q", auth_header)[0]
+                _read_exact(auth_len)  # consume the auth frame
+                ack = b'{"status":"success","result":{"message":"authenticated"}}'
+                conn.sendall(struct.pack(">Q", len(ack)) + ack)
+
             # Heartbeat frame (length=0)
             conn.sendall(struct.pack(">Q", 0))
             time.sleep(0.02)
